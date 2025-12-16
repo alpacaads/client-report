@@ -207,15 +207,226 @@ def mock_ads(client_id: str, start: dt.date, end: dt.date, platform: str) -> Ads
 
 @st.cache_data(show_spinner=False, ttl=900)
 def fetch_shopify_metrics(client_id: str, start: dt.date, end: dt.date, mock: bool) -> ShopifyMetrics:
+   import requests
+
+def _shopify_cfg(client_id: str) -> Dict[str, str]:
+    """
+    Reads Shopify config for a client from Streamlit secrets:
+    [shopify.<client_id>] store_domain, admin_api_version, access_token
+    """
+    try:
+        cfg = st.secrets["shopify"][client_id]
+        return {
+            "store_domain": str(cfg["store_domain"]).strip(),
+            "version": str(cfg.get("admin_api_version", "2025-01")).strip(),
+            "token": str(cfg["access_token"]).strip(),
+        }
+    except Exception as e:
+        raise RuntimeError(
+            f"Missing Shopify secrets for client_id='{client_id}'. "
+            f"Add [shopify.{client_id}] to .streamlit/secrets.toml"
+        ) from e
+
+def _shopify_graphql(client_id: str, query: str, variables: Dict) -> Dict:
+    cfg = _shopify_cfg(client_id)
+    url = f"https://{cfg['store_domain']}/admin/api/{cfg['version']}/graphql.json"
+    headers = {
+        "X-Shopify-Access-Token": cfg["token"],
+        "Content-Type": "application/json",
+    }
+
+    resp = requests.post(url, json={"query": query, "variables": variables}, headers=headers, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Shopify API HTTP {resp.status_code}: {resp.text[:4000]}")
+
+    payload = resp.json()
+    if "errors" in payload and payload["errors"]:
+        raise RuntimeError(f"Shopify GraphQL errors: {payload['errors']}")
+    if "data" not in payload:
+        raise RuntimeError(f"Shopify GraphQL missing data: {payload}")
+
+    return payload["data"]
+
+def _date_to_shopify_iso(d: dt.date, end_of_day: bool = False) -> str:
+    # Shopify expects ISO8601. We'll use UTC-like timestamps without timezone handling for now.
+    # Start inclusive, end inclusive: set end to 23:59:59.
+    if end_of_day:
+        return f"{d.isoformat()}T23:59:59"
+    return f"{d.isoformat()}T00:00:00"
+
+@st.cache_data(show_spinner=False, ttl=900)
+def fetch_shopify_metrics(client_id: str, start: dt.date, end: dt.date, mock: bool) -> ShopifyMetrics:
     if mock:
         return mock_shopify(client_id, start, end)
 
-    # REAL IMPLEMENTATION PLACE:
-    # - Authenticate per client (token in secrets/DB)
-    # - Query Shopify Admin API / Analytics
-    # - Build the exact ShopifyMetrics object
+    # ---- Query: Orders in date range ----
+    # We pull:
+    # - processedAt (for daily revenue)
+    # - totalPriceSet (for revenue)
+    # - lineItems (for product qty + revenue attribution)
+    # - customer.ordersCount (to estimate new vs returning in-store customers)
+    # - sourceName (rough "sales channel" proxy)
+    #
+    # NOTE: Sessions + conversion rate are not reliably available via Admin API alone.
+    # You'll typically use Shopify Analytics reports or GA4. For this test, we'll return 0 and show a note in UI.
+    query = """
+    query Orders($first: Int!, $after: String, $query: String!) {
+      orders(first: $first, after: $after, query: $query, sortKey: PROCESSED_AT) {
+        pageInfo { hasNextPage endCursor }
+        edges {
+          node {
+            id
+            name
+            processedAt
+            sourceName
+            totalPriceSet { shopMoney { amount currencyCode } }
 
-    raise NotImplementedError("Shopify connector not implemented (turn on Mock mode for now).")
+            customer {
+              id
+              ordersCount
+            }
+
+            lineItems(first: 100) {
+              edges {
+                node {
+                  title
+                  quantity
+                  sku
+                  originalTotalSet { shopMoney { amount currencyCode } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    start_iso = _date_to_shopify_iso(start, end_of_day=False)
+    end_iso = _date_to_shopify_iso(end, end_of_day=True)
+    # Shopify query syntax:
+    # processed_at:>=YYYY-MM-DD AND processed_at:<=YYYY-MM-DD
+    # We'll include full timestamps.
+    q = f"processed_at:>={start_iso} AND processed_at:<={end_iso} AND status:any"
+
+    first = 100
+    after = None
+
+    orders_rows = []
+    product_rows = []
+
+    # Track unique customers and whether they are new/returning based on ordersCount
+    customer_first_seen = set()
+    new_customers = 0
+    returning_customers = 0
+
+    # Revenue by "channel" (sourceName)
+    channel_revenue = {}
+
+    # Timeseries revenue by day
+    revenue_by_day = {}
+
+    while True:
+        data = _shopify_graphql(
+            client_id,
+            query,
+            {"first": first, "after": after, "query": q},
+        )
+
+        conn = data["orders"]
+        for edge in conn["edges"]:
+            o = edge["node"]
+            processed_at = o.get("processedAt")
+            source_name = o.get("sourceName") or "Unknown"
+            total_amount = float(o["totalPriceSet"]["shopMoney"]["amount"])
+
+            # Revenue by channel
+            channel_revenue[source_name] = channel_revenue.get(source_name, 0.0) + total_amount
+
+            # Revenue by day
+            day = processed_at[:10] if processed_at else start.isoformat()
+            revenue_by_day[day] = revenue_by_day.get(day, 0.0) + total_amount
+
+            # New vs returning customers (unique customers in range, based on lifetime ordersCount)
+            cust = o.get("customer")
+            if cust and cust.get("id"):
+                cid = cust["id"]
+                if cid not in customer_first_seen:
+                    customer_first_seen.add(cid)
+                    orders_count = int(cust.get("ordersCount") or 0)
+                    # If ordersCount == 1, this order is likely their first-ever order => new customer
+                    if orders_count <= 1:
+                        new_customers += 1
+                    else:
+                        returning_customers += 1
+
+            # Product sales (line items)
+            for li_edge in o["lineItems"]["edges"]:
+                li = li_edge["node"]
+                product_rows.append({
+                    "product": li.get("title") or "Unknown",
+                    "sku": li.get("sku") or "",
+                    "qty": int(li.get("quantity") or 0),
+                    "revenue": float(li["originalTotalSet"]["shopMoney"]["amount"]),
+                })
+
+            orders_rows.append({
+                "order_name": o.get("name"),
+                "processedAt": processed_at,
+                "sourceName": source_name,
+                "revenue": total_amount,
+            })
+
+        page = conn["pageInfo"]
+        if not page["hasNextPage"]:
+            break
+        after = page["endCursor"]
+
+    # Build DataFrames
+    revenue_total = float(sum(r["revenue"] for r in orders_rows)) if orders_rows else 0.0
+
+    revenue_by_channel_df = (
+        pd.DataFrame([{"channel": k, "revenue": v} for k, v in channel_revenue.items()])
+        if channel_revenue else
+        pd.DataFrame(columns=["channel", "revenue"])
+    ).sort_values("revenue", ascending=False)
+
+    product_sales_df = (
+        pd.DataFrame(product_rows)
+        if product_rows else
+        pd.DataFrame(columns=["product", "sku", "qty", "revenue"])
+    )
+
+    if not product_sales_df.empty:
+        product_sales_df = (
+            product_sales_df
+            .groupby(["product", "sku"], as_index=False)[["qty", "revenue"]]
+            .sum()
+            .sort_values("revenue", ascending=False)
+        )
+
+    # Fill missing days in revenue series
+    all_days = [d.isoformat() for d in daterange(start, end)]
+    revenue_timeseries_df = pd.DataFrame({
+        "date": all_days,
+        "revenue": [float(revenue_by_day.get(day, 0.0)) for day in all_days]
+    })
+
+    # Sessions / conversion rate
+    # Not reliably available via Admin API. For now return 0 and handle later with GA4 or Shopify Analytics.
+    sessions = 0
+    conversion_rate = 0.0
+
+    return ShopifyMetrics(
+        revenue_total=revenue_total,
+        revenue_by_channel=revenue_by_channel_df,
+        product_sales=product_sales_df,
+        new_customers=new_customers,
+        returning_customers=returning_customers,
+        conversion_rate=conversion_rate,
+        sessions=sessions,
+        revenue_timeseries=revenue_timeseries_df,
+    )
 
 @st.cache_data(show_spinner=False, ttl=900)
 def fetch_meta_metrics(client_id: str, start: dt.date, end: dt.date, mock: bool) -> AdsMetrics:
