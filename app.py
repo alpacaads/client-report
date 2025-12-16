@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-
+import requests
 # -----------------------------
 # App config
 # -----------------------------
